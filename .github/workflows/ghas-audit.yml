@@ -1,0 +1,189 @@
+name: GHAS Workflow Audit
+
+# Audits .github/workflows/*.yml files across the supplied orgs and produces
+# two CSVs per org (findings + action inventory), then merges them.
+#
+# This workflow must pass its own audit:
+#   - every action is pinned by full commit SHA
+#   - least-privilege permissions are declared
+#   - timeout-minutes is set on every job
+
+on:
+  workflow_dispatch:
+    inputs:
+      org-names:
+        description: 'Optional: comma-separated orgs to scan. Leave blank to use orgs.txt.'
+        required: false
+        default: ''
+      repo-limit:
+        description: 'Optional cap on repos per org (blank = no limit)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  prepare:
+    runs-on: [self-hosted, bolt-ubuntu]
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      org-matrix: ${{ steps.build.outputs.org-matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Build org matrix
+        id: build
+        # Org list precedence:
+        #   1. the org-names input, if provided at run time (one-off override)
+        #   2. otherwise the committed orgs.txt file
+        # orgs.txt: one org per line; blank lines and # comments are ignored.
+        # Pure bash so this job has no Python or jq dependency. GitHub org
+        # logins are limited to alphanumerics and hyphens, so building the
+        # JSON array by hand is safe (no escaping hazards). The trim helper
+        # also strips stray carriage returns so a CRLF orgs.txt still works.
+        env:
+          ORG_NAMES: ${{ github.event.inputs.org-names }}
+        run: |
+          set -euo pipefail
+
+          trim() {
+            local s="${1//$'\r'/}"
+            s="${s#"${s%%[![:space:]]*}"}"
+            s="${s%"${s##*[![:space:]]}"}"
+            printf '%s' "$s"
+          }
+
+          orgs=()
+          if [ -n "$(trim "$ORG_NAMES")" ]; then
+            IFS=',' read -ra parts <<< "$ORG_NAMES"
+            for p in "${parts[@]}"; do
+              p="$(trim "$p")"
+              [ -n "$p" ] && orgs+=("$p")
+            done
+          elif [ -f orgs.txt ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+              line="$(trim "$line")"
+              case "$line" in ""|\#*) continue ;; esac
+              orgs+=("$line")
+            done < orgs.txt
+          fi
+
+          if [ "${#orgs[@]}" -eq 0 ]; then
+            echo "No orgs to scan: orgs.txt is empty and no org-names input was given." >&2
+            exit 1
+          fi
+
+          matrix="["
+          for i in "${!orgs[@]}"; do
+            [ "$i" -gt 0 ] && matrix="$matrix,"
+            matrix="$matrix\"${orgs[$i]}\""
+          done
+          matrix="$matrix]"
+          echo "org-matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  audit:
+    needs: prepare
+    runs-on: [self-hosted, bolt-ubuntu]
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      matrix:
+        org: ${{ fromJson(needs.prepare.outputs.org-matrix) }}
+      fail-fast: false
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r bin/requirements.txt
+
+      - name: Generate installation token
+        uses: pfizer-github-automation/github-oidc-action@f5262de087feab1ec962d1348bce634037611b93
+        id: app-token
+        with:
+          github-app-name: 'oidc-emu-migration'
+          permissions: '{"contents": "read", "metadata": "read"}'
+          org: ${{ matrix.org }}
+
+      - name: Run audit
+        run: |
+          python3 bin/audit_workflows.py \
+            --org "${{ matrix.org }}" \
+            --output-dir "results/${{ matrix.org }}" \
+            ${{ github.event.inputs.repo-limit != '' && format('--repo-limit {0}', github.event.inputs.repo-limit) || '' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      - name: Upload per-org results
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: audit-${{ matrix.org }}
+          path: results/
+          if-no-files-found: warn
+
+  merge:
+    needs: audit
+    if: always()
+    runs-on: [self-hosted, bolt-ubuntu]
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Download all per-org artifacts
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          path: downloaded
+
+      - name: Combine CSVs
+        # Concatenate every per-org findings/inventory CSV into two combined
+        # files. Keeps a single header row across all parts.
+        run: |
+          python3 - <<'PY'
+          import csv, glob, os
+
+          def combine(pattern, out_path):
+              parts = sorted(glob.glob(pattern, recursive=True))
+              if not parts:
+                  print(f"No files matched {pattern}")
+                  return
+              os.makedirs(os.path.dirname(out_path), exist_ok=True)
+              header_written = False
+              with open(out_path, "w", newline="", encoding="utf-8") as out:
+                  writer = None
+                  for part in parts:
+                      with open(part, newline="", encoding="utf-8") as fh:
+                          reader = csv.reader(fh)
+                          header = next(reader, None)
+                          if header is None:
+                              continue
+                          if not header_written:
+                              writer = csv.writer(out)
+                              writer.writerow(header)
+                              header_written = True
+                          for row in reader:
+                              writer.writerow(row)
+              print(f"Wrote {out_path} from {len(parts)} file(s)")
+
+          combine("downloaded/**/findings.csv", "combined/findings_all.csv")
+          combine("downloaded/**/action_inventory.csv", "combined/action_inventory_all.csv")
+          PY
+
+      - name: Upload combined results
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: audit-combined
+          path: combined/
+          if-no-files-found: warn

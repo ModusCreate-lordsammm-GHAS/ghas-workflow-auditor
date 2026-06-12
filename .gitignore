@@ -1,0 +1,11 @@
+# Local-only secrets and scratch output. Never commit.
+.local/
+*.pem
+output/
+out/
+results/
+combined/
+downloaded/
+__pycache__/
+*.pyc
+.pytest_cache/
