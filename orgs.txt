@@ -6,6 +6,27 @@
 # The GitHub App must be installed in every org listed here.
 #
 # Replace the examples below with your real org logins.
-pfizer-devex
 pfizer
+pfizer-analytics
+pfizer-business-services
+pfizer-seagen
 pfizer-rd
+pfizer-pic
+pfizer-operations-and-insights
+pfizer-oneweb
+pfizer-marm
+pfizer-ld
+pfizer-fit
+pfizer-finance
+pfizer-evgen
+pfizer-esc
+pfizer-eps-dpp
+pfizer-eps
+pfizer-digital-supply
+pfizer-digital-manufacuring
+pfizer-devex
+pfizer-compliance
+pfizer-commercial
+pfizer-clinical-supply
+pfizer-utils
+
