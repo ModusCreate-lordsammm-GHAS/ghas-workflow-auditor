@@ -1,0 +1,230 @@
+name: GHAS Workflow Audit
+
+# Audits .github/workflows/*.yml files across the supplied orgs and produces
+# two CSVs per org (findings + action inventory), then merges them.
+#
+# This workflow must pass its own audit:
+#   - every action is pinned by full commit SHA
+#   - least-privilege permissions are declared
+#   - timeout-minutes is set on every job
+
+on:
+  workflow_dispatch:
+    inputs:
+      org-names:
+        description: 'Optional: comma-separated orgs to scan. Leave blank to use orgs.txt.'
+        required: false
+        default: ''
+      repo-limit:
+        description: 'Optional cap on repos per org (blank = no limit)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  prepare:
+    runs-on: [self-hosted, bolt-ubuntu]
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      org-matrix: ${{ steps.build.outputs.org-matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Build org matrix
+        id: build
+        # Org list precedence:
+        #   1. the org-names input, if provided at run time (one-off override)
+        #   2. otherwise the committed orgs.txt file
+        # orgs.txt: one org per line; blank lines and # comments are ignored.
+        # Pure bash so this job has no Python or jq dependency. GitHub org
+        # logins are limited to alphanumerics and hyphens, so building the
+        # JSON array by hand is safe (no escaping hazards). The trim helper
+        # also strips stray carriage returns so a CRLF orgs.txt still works.
+        env:
+          ORG_NAMES: ${{ github.event.inputs.org-names }}
+        run: |
+          set -euo pipefail
+
+          trim() {
+            local s="${1//$'\r'/}"
+            s="${s#"${s%%[![:space:]]*}"}"
+            s="${s%"${s##*[![:space:]]}"}"
+            printf '%s' "$s"
+          }
+
+          orgs=()
+          if [ -n "$(trim "$ORG_NAMES")" ]; then
+            IFS=',' read -ra parts <<< "$ORG_NAMES"
+            for p in "${parts[@]}"; do
+              p="$(trim "$p")"
+              [ -n "$p" ] && orgs+=("$p")
+            done
+          elif [ -f orgs.txt ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+              line="$(trim "$line")"
+              case "$line" in ""|\#*) continue ;; esac
+              orgs+=("$line")
+            done < orgs.txt
+          fi
+
+          if [ "${#orgs[@]}" -eq 0 ]; then
+            echo "No orgs to scan: orgs.txt is empty and no org-names input was given." >&2
+            exit 1
+          fi
+
+          matrix="["
+          for i in "${!orgs[@]}"; do
+            [ "$i" -gt 0 ] && matrix="$matrix,"
+            matrix="$matrix\"${orgs[$i]}\""
+          done
+          matrix="$matrix]"
+          echo "org-matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  audit:
+    needs: prepare
+    runs-on: [self-hosted, bolt-ubuntu]
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      matrix:
+        org: ${{ fromJson(needs.prepare.outputs.org-matrix) }}
+      fail-fast: false
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Setup Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r bin/requirements.txt
+
+      - name: Generate installation token
+        uses: pfizer-github-automation/github-oidc-action@f5262de087feab1ec962d1348bce634037611b93
+        id: app-token
+        with:
+          github-app-name: 'oidc-emu-migration'
+          permissions: '{"contents": "read", "metadata": "read", "administration": "read"}'
+          org: ${{ matrix.org }}
+
+      - name: Run audit
+        run: |
+          python3 bin/audit_workflows.py \
+            --org "${{ matrix.org }}" \
+            --output-dir "results/${{ matrix.org }}" \
+            ${{ github.event.inputs.repo-limit != '' && format('--repo-limit {0}', github.event.inputs.repo-limit) || '' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      - name: Upload per-org results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: audit-${{ matrix.org }}
+          path: results/
+          if-no-files-found: warn
+
+  merge:
+    needs: audit
+    if: always()
+    runs-on: [self-hosted, bolt-ubuntu]
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: write  # required to delete the per-org artifacts after merging
+    steps:
+      - name: Download all per-org artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: downloaded
+          pattern: audit-*
+
+      - name: Combine CSVs
+        # Concatenate every per-org findings/inventory CSV into two combined
+        # files. Keeps a single header row across all parts.
+        run: |
+          python3 - <<'PY'
+          import csv, glob, os
+
+          def combine(pattern, out_path):
+              parts = sorted(glob.glob(pattern, recursive=True))
+              if not parts:
+                  print(f"No files matched {pattern}")
+                  return
+              os.makedirs(os.path.dirname(out_path), exist_ok=True)
+              header_written = False
+              with open(out_path, "w", newline="", encoding="utf-8") as out:
+                  writer = None
+                  for part in parts:
+                      with open(part, newline="", encoding="utf-8") as fh:
+                          reader = csv.reader(fh)
+                          header = next(reader, None)
+                          if header is None:
+                              continue
+                          if not header_written:
+                              writer = csv.writer(out)
+                              writer.writerow(header)
+                              header_written = True
+                          for row in reader:
+                              writer.writerow(row)
+              print(f"Wrote {out_path} from {len(parts)} file(s)")
+
+          combine("downloaded/**/findings.csv", "combined/findings_all.csv")
+          combine("downloaded/**/action_inventory.csv", "combined/action_inventory_all.csv")
+          combine("downloaded/**/summary.csv", "combined/summary_all.csv")
+          PY
+
+      - name: Upload combined results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: audit-combined
+          path: combined/
+          if-no-files-found: warn
+
+      - name: Delete per-org artifacts
+        # The per-org artifacts only exist so this job can merge them. Once the
+        # combined artifact is uploaded, drop them so only `audit-combined`
+        # remains attached to the workflow run.
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          page=1
+          while :; do
+            resp=$(curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100&page=${page}")
+            ids=$(printf '%s' "$resp" | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          for a in data.get('artifacts', []):
+              name = a.get('name', '')
+              if name.startswith('audit-') and name != 'audit-combined':
+                  print(a['id'])
+          ")
+            [ -z "$ids" ] && break
+            for id in $ids; do
+              echo "Deleting artifact $id"
+              curl -fsSL -X DELETE \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${REPO}/actions/artifacts/${id}" || true
+            done
+            count=$(printf '%s' "$resp" | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('artifacts', [])))")
+            [ "$count" -lt 100 ] && break
+            page=$((page + 1))
+          done
