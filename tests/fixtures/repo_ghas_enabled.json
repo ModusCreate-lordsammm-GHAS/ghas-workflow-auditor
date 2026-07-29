@@ -1,0 +1,17 @@
+{
+  "name": "service-api",
+  "visibility": "private",
+  "archived": false,
+  "disabled": false,
+  "default_branch": "main",
+  "pushed_at": "2026-07-20T10:00:00Z",
+  "updated_at": "2026-07-21T11:00:00Z",
+  "security_and_analysis": {
+    "advanced_security": { "status": "enabled" },
+    "secret_scanning": { "status": "enabled" },
+    "secret_scanning_push_protection": { "status": "enabled" },
+    "dependabot_security_updates": { "status": "enabled" },
+    "secret_scanning_non_provider_patterns": { "status": "disabled" },
+    "secret_scanning_validity_checks": { "status": "enabled" }
+  }
+}

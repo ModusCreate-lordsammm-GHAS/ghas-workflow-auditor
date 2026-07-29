@@ -9,3 +9,16 @@ downloaded/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Generated audit/metrics CSV outputs (produced by the scripts, not source)
+findings*.csv
+action_inventory*.csv
+summary*.csv
+platform_metrics_*.csv
+reports/
+
+# Local working data / exports (not part of the tool)
+*.xlsx
+*.crdownload
+convert/
+powerbi/

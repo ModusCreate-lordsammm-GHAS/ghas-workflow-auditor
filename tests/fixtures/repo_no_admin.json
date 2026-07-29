@@ -1,0 +1,9 @@
+{
+  "name": "no-admin-repo",
+  "visibility": "internal",
+  "archived": false,
+  "disabled": false,
+  "default_branch": "main",
+  "pushed_at": "2026-06-01T00:00:00Z",
+  "updated_at": "2026-06-02T00:00:00Z"
+}

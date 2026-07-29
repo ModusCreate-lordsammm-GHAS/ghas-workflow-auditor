@@ -1,0 +1,17 @@
+{
+  "name": "legacy-site",
+  "visibility": "public",
+  "archived": false,
+  "disabled": false,
+  "default_branch": "master",
+  "pushed_at": "2025-01-02T09:00:00Z",
+  "updated_at": "2025-01-03T09:00:00Z",
+  "security_and_analysis": {
+    "advanced_security": { "status": "disabled" },
+    "secret_scanning": { "status": "disabled" },
+    "secret_scanning_push_protection": { "status": "disabled" },
+    "dependabot_security_updates": { "status": "disabled" },
+    "secret_scanning_non_provider_patterns": { "status": "disabled" },
+    "secret_scanning_validity_checks": { "status": "disabled" }
+  }
+}

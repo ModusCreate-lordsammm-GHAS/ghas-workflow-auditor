@@ -1,0 +1,274 @@
+name: GHAS Platform Metrics
+
+# Collects an enterprise-wide baseline of GHAS feature adoption across the
+# supplied orgs and produces two CSVs per org (by-org + by-repo), then merges
+# them into combined enterprise CSVs and appends a TOTAL summary row.
+#
+# Separate capability from ghas-audit.yml: it shares only the OIDC auth pattern
+# and orgs.txt. Same self-imposed rules as the audit workflow:
+#   - every action is pinned by full commit SHA
+#   - least-privilege permissions are declared
+#   - timeout-minutes is set on every job
+
+on:
+  workflow_dispatch:
+    inputs:
+      org-names:
+        description: 'Optional: comma-separated orgs to scan. Leave blank to use orgs.txt.'
+        required: false
+        default: ''
+      repo-limit:
+        description: 'Optional cap on repos per org (blank = no limit)'
+        required: false
+        default: ''
+      skip-repo-scan:
+        description: 'Set to "true" for a fast org-level-only smoke test'
+        required: false
+        default: ''
+  # Uncomment for a monthly refresh once the tool is validated:
+  # schedule:
+  #   - cron: '0 6 1 * *'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  prepare:
+    runs-on: [self-hosted, bolt-ubuntu]
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      org-matrix: ${{ steps.build.outputs.org-matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Build org matrix
+        id: build
+        # Org list precedence:
+        #   1. the org-names input, if provided at run time (one-off override)
+        #   2. otherwise the committed orgs.txt file
+        # orgs.txt: one org per line; blank lines and # comments are ignored.
+        # Pure bash so this job has no Python or jq dependency. GitHub org
+        # logins are limited to alphanumerics and hyphens, so building the
+        # JSON array by hand is safe (no escaping hazards). The trim helper
+        # also strips stray carriage returns so a CRLF orgs.txt still works.
+        env:
+          ORG_NAMES: ${{ github.event.inputs.org-names }}
+        run: |
+          set -euo pipefail
+
+          trim() {
+            local s="${1//$'\r'/}"
+            s="${s#"${s%%[![:space:]]*}"}"
+            s="${s%"${s##*[![:space:]]}"}"
+            printf '%s' "$s"
+          }
+
+          orgs=()
+          if [ -n "$(trim "$ORG_NAMES")" ]; then
+            IFS=',' read -ra parts <<< "$ORG_NAMES"
+            for p in "${parts[@]}"; do
+              p="$(trim "$p")"
+              [ -n "$p" ] && orgs+=("$p")
+            done
+          elif [ -f orgs.txt ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+              line="$(trim "$line")"
+              case "$line" in ""|\#*) continue ;; esac
+              orgs+=("$line")
+            done < orgs.txt
+          fi
+
+          if [ "${#orgs[@]}" -eq 0 ]; then
+            echo "No orgs to scan: orgs.txt is empty and no org-names input was given." >&2
+            exit 1
+          fi
+
+          matrix="["
+          for i in "${!orgs[@]}"; do
+            [ "$i" -gt 0 ] && matrix="$matrix,"
+            matrix="$matrix\"${orgs[$i]}\""
+          done
+          matrix="$matrix]"
+          echo "org-matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  metrics:
+    needs: prepare
+    runs-on: [self-hosted, bolt-ubuntu]
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      matrix:
+        org: ${{ fromJson(needs.prepare.outputs.org-matrix) }}
+      fail-fast: false
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Setup Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r bin/requirements.txt
+
+      - name: Generate installation token
+        uses: pfizer-github-automation/github-oidc-action@f5262de087feab1ec962d1348bce634037611b93
+        id: app-token
+        with:
+          github-app-name: 'oidc-emu-migration'
+          # Expanded beyond the audit workflow: copilot + organization_administration
+          # are needed for the billing/seat endpoints. If the App is not granted
+          # these, the script marks the affected metrics n/a and continues.
+          permissions: '{"contents": "read", "metadata": "read", "administration": "read", "copilot": "read", "organization_administration": "read"}'
+          org: ${{ matrix.org }}
+
+      - name: Collect platform metrics
+        run: |
+          python3 bin/collect_platform_metrics.py \
+            --org "${{ matrix.org }}" \
+            --output-dir "results/${{ matrix.org }}" \
+            ${{ github.event.inputs.repo-limit != '' && format('--repo-limit {0}', github.event.inputs.repo-limit) || '' }} \
+            ${{ github.event.inputs.skip-repo-scan == 'true' && '--skip-repo-scan' || '' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      - name: Upload per-org results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: metrics-${{ matrix.org }}
+          path: results/
+          if-no-files-found: warn
+
+  merge:
+    needs: metrics
+    if: always()
+    runs-on: [self-hosted, bolt-ubuntu]
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: write  # required to delete the per-org artifacts after merging
+    steps:
+      - name: Checkout
+        # Needed so the combine step can reuse total_row/BY_ORG_HEADER from the
+        # metrics script rather than re-deriving the TOTAL math in the workflow.
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Download all per-org artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: downloaded
+          pattern: metrics-*
+
+      - name: Combine CSVs and append TOTAL row
+        # Concatenate every per-org CSV into two combined files (single header),
+        # then append a TOTAL row to the by-org file summing the numeric columns
+        # across orgs (n/a cells skipped) via the script's own total_row().
+        run: |
+          python3 - <<'PY'
+          import csv, glob, os, sys
+          sys.path.insert(0, "bin")
+          import collect_platform_metrics as m
+
+          def combine(pattern, out_path):
+              parts = sorted(glob.glob(pattern, recursive=True))
+              if not parts:
+                  print(f"No files matched {pattern}")
+                  return [], []
+              os.makedirs(os.path.dirname(out_path), exist_ok=True)
+              header, rows = None, []
+              for part in parts:
+                  with open(part, newline="", encoding="utf-8") as fh:
+                      reader = csv.reader(fh)
+                      h = next(reader, None)
+                      if h is None:
+                          continue
+                      header = h
+                      rows.extend(reader)
+              if header is None:
+                  return [], []
+              with open(out_path, "w", newline="", encoding="utf-8") as out:
+                  writer = csv.writer(out)
+                  writer.writerow(header)
+                  writer.writerows(rows)
+              print(f"Wrote {out_path} from {len(parts)} file(s)")
+              return header, rows
+
+          # by-repo: straight concatenation.
+          combine("downloaded/**/platform_metrics_by_repo.csv",
+                  "combined/platform_metrics_by_repo.csv")
+
+          # by-org: concatenate, then append a TOTAL row.
+          header, rows = combine("downloaded/**/platform_metrics_by_org.csv",
+                                 "combined/platform_metrics_by_org.csv")
+          if header:
+              # Rebuild per-org metric dicts, coercing numeric strings back to
+              # numbers and leaving "n/a" as the NA sentinel so total_row skips it.
+              def coerce(v):
+                  if v == m.NA:
+                      return m.NA
+                  try:
+                      return int(v)
+                  except ValueError:
+                      try:
+                          return float(v)
+                      except ValueError:
+                          return v
+              org_dicts = [{h: coerce(v) for h, v in zip(header, row)} for row in rows]
+              total = m.total_row(org_dicts)
+              with open("combined/platform_metrics_by_org.csv", "a", newline="", encoding="utf-8") as out:
+                  csv.writer(out).writerow([m._cell(total.get(c, "")) for c in header])
+              print("Appended TOTAL row")
+          PY
+
+      - name: Upload combined results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: metrics-combined
+          path: combined/
+          if-no-files-found: warn
+
+      - name: Delete per-org artifacts
+        # The per-org artifacts only exist so this job can merge them. Once the
+        # combined artifact is uploaded, drop them so only `metrics-combined`
+        # remains attached to the workflow run.
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          page=1
+          while :; do
+            resp=$(curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100&page=${page}")
+            ids=$(printf '%s' "$resp" | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          for a in data.get('artifacts', []):
+              name = a.get('name', '')
+              if name.startswith('metrics-') and name != 'metrics-combined':
+                  print(a['id'])
+          ")
+            [ -z "$ids" ] && break
+            for id in $ids; do
+              echo "Deleting artifact $id"
+              curl -fsSL -X DELETE \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${REPO}/actions/artifacts/${id}" || true
+            done
+            count=$(printf '%s' "$resp" | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('artifacts', [])))")
+            [ "$count" -lt 100 ] && break
+            page=$((page + 1))
+          done

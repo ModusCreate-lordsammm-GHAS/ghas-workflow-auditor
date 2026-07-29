@@ -1,0 +1,10 @@
+{
+  "total_minutes_used": 3050,
+  "total_paid_minutes_used": 550,
+  "included_minutes": 2500,
+  "minutes_used_breakdown": {
+    "UBUNTU": 2000,
+    "MACOS": 800,
+    "WINDOWS": 250
+  }
+}

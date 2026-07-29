@@ -1,0 +1,12 @@
+{
+  "seat_breakdown": {
+    "total": 120,
+    "added_this_cycle": 5,
+    "pending_invitation": 3,
+    "pending_cancellation": 2,
+    "active_this_cycle": 90,
+    "inactive_this_cycle": 30
+  },
+  "seat_management_setting": "assign_selected",
+  "public_code_suggestions": "block"
+}
